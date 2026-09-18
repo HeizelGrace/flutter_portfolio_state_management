@@ -20,11 +20,11 @@ void main() {
       ),
     );
 
-    await tester.tap(find.text('Stateful counter'));
+    await tester.tap(find.text('State & responsive layout'));
     await tester.pumpAndSettle();
 
     expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
+    expect(find.text('Responsive by default'), findsOneWidget);
 
     await tester.tap(find.text('Increment'));
     await tester.pump();
@@ -33,7 +33,9 @@ void main() {
     expect(find.text('1'), findsOneWidget);
   });
 
-  testWidgets('Responsive layout activity smoke test', (WidgetTester tester) async {
+  testWidgets('Network monitor activity smoke test', (
+    WidgetTester tester,
+  ) async {
     await tester.pumpWidget(
       ChangeNotifierProvider(
         create: (_) => ThemeProvider(),
@@ -41,11 +43,11 @@ void main() {
       ),
     );
 
-    await tester.tap(find.text('Responsive layout'));
+    await tester.tap(find.text('Network monitor'));
     await tester.pumpAndSettle();
 
-    expect(find.text('Activity 02'), findsOneWidget);
-    expect(find.text('Flexible progress'), findsOneWidget);
+    expect(find.text('Activity 02 — Network Monitor'), findsOneWidget);
+    expect(find.text('Active Interface'), findsOneWidget);
   });
 
   testWidgets('Theme toggle smoke test', (WidgetTester tester) async {
