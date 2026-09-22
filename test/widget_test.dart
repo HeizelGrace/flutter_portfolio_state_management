@@ -12,6 +12,49 @@ import 'package:provider/provider.dart';
 import 'package:portfolio_state_management/main.dart';
 
 void main() {
+  test('network health thresholds classify the minimum bandwidth', () {
+    expect(
+      NetworkDiagnosticService.classify(
+        downloadMbps: 25,
+        uploadMbps: 12,
+        idlePingMs: 20,
+        downloadPingMs: 30,
+        uploadPingMs: 35,
+      ),
+      NetworkHealth.excellent,
+    );
+    expect(
+      NetworkDiagnosticService.classify(
+        downloadMbps: 8,
+        uploadMbps: 2,
+        idlePingMs: 40,
+        downloadPingMs: 50,
+        uploadPingMs: 55,
+      ),
+      NetworkHealth.fair,
+    );
+    expect(
+      NetworkDiagnosticService.classify(
+        downloadMbps: 1.5,
+        uploadMbps: 1,
+        idlePingMs: 40,
+        downloadPingMs: 50,
+        uploadPingMs: 55,
+      ),
+      NetworkHealth.poor,
+    );
+    expect(
+      NetworkDiagnosticService.classify(
+        downloadMbps: 20,
+        uploadMbps: 20,
+        idlePingMs: 1200,
+        downloadPingMs: 80,
+        uploadPingMs: 90,
+      ),
+      NetworkHealth.degraded,
+    );
+  });
+
   testWidgets('Counter increments smoke test', (WidgetTester tester) async {
     await tester.pumpWidget(
       ChangeNotifierProvider(

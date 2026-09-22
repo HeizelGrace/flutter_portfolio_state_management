@@ -1,12 +1,17 @@
 import 'dart:async';
+import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:http/http.dart' as http;
 
 void main() => runApp(
-  ChangeNotifierProvider(
-    create: (_) => ThemeProvider(),
+  MultiProvider(
+    providers: [
+      ChangeNotifierProvider(create: (_) => ThemeProvider()),
+      ChangeNotifierProvider(create: (_) => NetworkHealthProvider()),
+    ],
     child: const PortfolioApp(),
   ),
 );
@@ -17,6 +22,189 @@ class ThemeProvider extends ChangeNotifier {
   void toggleTheme(bool value) {
     _isDark = value;
     notifyListeners();
+  }
+}
+
+enum NetworkHealth { unknown, testing, excellent, fair, poor, degraded }
+
+enum DiagnosticPhase { idle, idlePing, download, upload, complete }
+
+class NetworkDiagnosticResult {
+  const NetworkDiagnosticResult({
+    required this.idlePingMs,
+    required this.downloadMbps,
+    required this.downloadPingMs,
+    required this.uploadMbps,
+    required this.uploadPingMs,
+    required this.health,
+  });
+
+  final int idlePingMs;
+  final double downloadMbps;
+  final int downloadPingMs;
+  final double uploadMbps;
+  final int uploadPingMs;
+  final NetworkHealth health;
+}
+
+class NetworkDiagnosticService {
+  NetworkDiagnosticService({http.Client? client})
+    : _client = client ?? http.Client();
+
+  final http.Client _client;
+  static final _pingUri = Uri.parse(
+    'https://speed.cloudflare.com/cdn-cgi/trace',
+  );
+  static final _downloadUri = Uri.parse(
+    'https://speed.cloudflare.com/__down?bytes=1000000',
+  );
+  static final _uploadUri = Uri.parse('https://speed.cloudflare.com/__up');
+
+  Future<int> _ping() async {
+    final stopwatch = Stopwatch()..start();
+    final response = await _client
+        .get(_pingUri)
+        .timeout(const Duration(seconds: 5));
+    stopwatch.stop();
+    if (response.statusCode < 200 || response.statusCode >= 400) {
+      throw Exception('Ping endpoint returned ${response.statusCode}');
+    }
+    return stopwatch.elapsedMilliseconds;
+  }
+
+  Future<double> _downloadMbps() async {
+    final stopwatch = Stopwatch()..start();
+    final response = await _client
+        .get(_downloadUri)
+        .timeout(const Duration(seconds: 15));
+    stopwatch.stop();
+    if (response.statusCode != 200) throw Exception('Download failed');
+    return _megabitsPerSecond(response.bodyBytes.length, stopwatch.elapsed);
+  }
+
+  Future<double> _uploadMbps() async {
+    final payload = List<int>.filled(250000, 65);
+    final stopwatch = Stopwatch()..start();
+    final response = await _client
+        .post(_uploadUri, body: payload)
+        .timeout(const Duration(seconds: 15));
+    stopwatch.stop();
+    if (response.statusCode < 200 || response.statusCode >= 400) {
+      throw Exception('Upload failed');
+    }
+    return _megabitsPerSecond(payload.length, stopwatch.elapsed);
+  }
+
+  double _megabitsPerSecond(int bytes, Duration elapsed) {
+    final seconds = max(
+      elapsed.inMicroseconds / Duration.microsecondsPerSecond,
+      0.001,
+    );
+    return (bytes * 8 / seconds) / 1000000;
+  }
+
+  Future<NetworkDiagnosticResult> run({
+    void Function(DiagnosticPhase)? onPhase,
+  }) async {
+    onPhase?.call(DiagnosticPhase.idlePing);
+    final idlePing = await _ping();
+    onPhase?.call(DiagnosticPhase.download);
+    final download = await Future.wait<Object>([_downloadMbps(), _ping()]);
+    final downloadMbps = download[0] as double;
+    final downloadPingMs = download[1] as int;
+    onPhase?.call(DiagnosticPhase.upload);
+    final upload = await Future.wait<Object>([_uploadMbps(), _ping()]);
+    final uploadMbps = upload[0] as double;
+    final uploadPingMs = upload[1] as int;
+    final result = NetworkDiagnosticResult(
+      idlePingMs: idlePing,
+      downloadMbps: downloadMbps,
+      downloadPingMs: downloadPingMs,
+      uploadMbps: uploadMbps,
+      uploadPingMs: uploadPingMs,
+      health: classify(
+        downloadMbps: downloadMbps,
+        uploadMbps: uploadMbps,
+        idlePingMs: idlePing,
+        downloadPingMs: downloadPingMs,
+        uploadPingMs: uploadPingMs,
+      ),
+    );
+    onPhase?.call(DiagnosticPhase.complete);
+    return result;
+  }
+
+  static NetworkHealth classify({
+    required double downloadMbps,
+    required double uploadMbps,
+    required int idlePingMs,
+    required int downloadPingMs,
+    required int uploadPingMs,
+  }) {
+    final averagePing = (idlePingMs + downloadPingMs + uploadPingMs) / 3;
+    if (averagePing > 500 || idlePingMs > 1000) return NetworkHealth.degraded;
+    final bandwidth = min(downloadMbps, uploadMbps);
+    if (bandwidth > 10) return NetworkHealth.excellent;
+    if (bandwidth >= 2) return NetworkHealth.fair;
+    return NetworkHealth.poor;
+  }
+
+  void dispose() => _client.close();
+}
+
+class NetworkHealthProvider extends ChangeNotifier {
+  NetworkHealthProvider({NetworkDiagnosticService? service})
+    : _service = service ?? NetworkDiagnosticService();
+
+  final NetworkDiagnosticService _service;
+  NetworkHealth _health = NetworkHealth.unknown;
+  DiagnosticPhase _phase = DiagnosticPhase.idle;
+  NetworkDiagnosticResult? _result;
+  String? _error;
+  Timer? _timer;
+  bool _isRunning = false;
+
+  NetworkHealth get health => _health;
+  DiagnosticPhase get phase => _phase;
+  NetworkDiagnosticResult? get result => _result;
+  String? get error => _error;
+  bool get isRunning => _isRunning;
+
+  void start() {
+    if (_timer != null) return;
+    runNow();
+    _timer = Timer.periodic(const Duration(minutes: 1), (_) => runNow());
+  }
+
+  Future<void> runNow() async {
+    if (_isRunning) return;
+    _isRunning = true;
+    _error = null;
+    _health = NetworkHealth.testing;
+    notifyListeners();
+    try {
+      _result = await _service.run(
+        onPhase: (phase) {
+          _phase = phase;
+          notifyListeners();
+        },
+      );
+      _health = _result!.health;
+    } catch (exception) {
+      _health = NetworkHealth.degraded;
+      _error = 'Diagnostic failed: $exception';
+      _phase = DiagnosticPhase.complete;
+    } finally {
+      _isRunning = false;
+      notifyListeners();
+    }
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _service.dispose();
+    super.dispose();
   }
 }
 
@@ -37,6 +225,7 @@ class PortfolioApp extends StatelessWidget {
         '/': (_) => const DashboardScreen(),
         '/activity-one': (_) => const ActivityOneScreen(),
         '/activity-two': (_) => const NetworkMonitorScreen(),
+        '/network-diagnostic': (_) => const NetworkDiagnosticScreen(),
         '/settings': (_) => const SettingsScreen(),
       },
     );
@@ -135,6 +324,15 @@ class DashboardScreen extends StatelessWidget {
                     description: 'Real-time network state with handover detection and automatic request retry.',
                     icon: Icons.wifi_tethering,
                     onTap: () => Navigator.pushNamed(context, '/activity-two'),
+                  ),
+                  const SizedBox(height: 16),
+                  ActivityCard(
+                    number: '03',
+                    title: 'Network diagnostic dashboard',
+                    description: 'Measure ping, download, and upload health to adapt the experience in real time.',
+                    icon: Icons.speed_outlined,
+                    onTap: () =>
+                        Navigator.pushNamed(context, '/network-diagnostic'),
                   ),
                   const SizedBox(height: 24),
                   const InfoPanel(
@@ -380,6 +578,221 @@ class SettingsScreen extends StatelessWidget {
 // ─────────────────────────────────────────────────────────────────────────────
 // Activity 02 — Network Monitor
 // ─────────────────────────────────────────────────────────────────────────────
+
+class NetworkDiagnosticScreen extends StatefulWidget {
+  const NetworkDiagnosticScreen({super.key});
+
+  @override
+  State<NetworkDiagnosticScreen> createState() =>
+      _NetworkDiagnosticScreenState();
+}
+
+class _NetworkDiagnosticScreenState extends State<NetworkDiagnosticScreen> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) context.read<NetworkHealthProvider>().start();
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final diagnostic = context.watch<NetworkHealthProvider>();
+    final result = diagnostic.result;
+    final scheme = Theme.of(context).colorScheme;
+    final color = _healthColor(diagnostic.health, scheme);
+    return AppShell(
+      title: 'Network Diagnostic Dashboard',
+      child: ListView(
+        padding: const EdgeInsets.all(24),
+        children: [
+          Text(
+            'Connection health, measured live',
+            style: Theme.of(context).textTheme.headlineMedium
+                ?.copyWith(fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'A three-step diagnostic runs every minute and publishes its tier across the app.',
+          ),
+          const SizedBox(height: 24),
+          Card(
+            color: color.withValues(alpha: .12),
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Row(
+                children: [
+                  Icon(_healthIcon(diagnostic.health), color: color, size: 42),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'CURRENT TIER',
+                          style: Theme.of(context).textTheme.labelMedium,
+                        ),
+                        Text(
+                          _healthLabel(diagnostic.health),
+                          style: Theme.of(context).textTheme.headlineSmall
+                              ?.copyWith(
+                                color: color,
+                                fontWeight: FontWeight.bold,
+                              ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(_phaseLabel(diagnostic.phase)),
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Run diagnostic now',
+                    onPressed: diagnostic.isRunning ? null : diagnostic.runNow,
+                    icon: const Icon(Icons.refresh),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (diagnostic.isRunning) ...[
+            const SizedBox(height: 16),
+            LinearProgressIndicator(value: _phaseProgress(diagnostic.phase)),
+          ],
+          if (diagnostic.error != null) ...[
+            const SizedBox(height: 12),
+            Text(diagnostic.error!, style: TextStyle(color: scheme.error)),
+          ],
+          const SizedBox(height: 24),
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final columns = constraints.maxWidth > 650 ? 3 : 1;
+              return GridView.count(
+                crossAxisCount: columns,
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                crossAxisSpacing: 12,
+                mainAxisSpacing: 12,
+                childAspectRatio: columns == 1 ? 3.2 : 1.35,
+                children: [
+                  _MetricCard(
+                    label: 'Idle ping',
+                    value: _metric(result?.idlePingMs, 'ms'),
+                    icon: Icons.radio_button_checked,
+                  ),
+                  _MetricCard(
+                    label: 'Download',
+                    value: _metric(result?.downloadMbps, 'Mbps'),
+                    icon: Icons.download_outlined,
+                  ),
+                  _MetricCard(
+                    label: 'Download ping',
+                    value: _metric(result?.downloadPingMs, 'ms'),
+                    icon: Icons.swap_vert,
+                  ),
+                  _MetricCard(
+                    label: 'Upload',
+                    value: _metric(result?.uploadMbps, 'Mbps'),
+                    icon: Icons.upload_outlined,
+                  ),
+                  _MetricCard(
+                    label: 'Upload ping',
+                    value: _metric(result?.uploadPingMs, 'ms'),
+                    icon: Icons.swap_vert,
+                  ),
+                ],
+              );
+            },
+          ),
+          const SizedBox(height: 24),
+          InfoPanel(
+            icon: Icons.auto_awesome,
+            title: 'Adaptive delivery policy',
+            message: 'Excellent: full-resolution media. Fair: optimized media. Poor: lightweight placeholders. Degraded: offline-first fallback.',
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _metric(num? value, String unit) => value == null
+      ? '--'
+      : '${value is double ? value.toStringAsFixed(1) : value} $unit';
+
+  double _phaseProgress(DiagnosticPhase phase) => switch (phase) {
+    DiagnosticPhase.idlePing => .2,
+    DiagnosticPhase.download => .5,
+    DiagnosticPhase.upload => .8,
+    DiagnosticPhase.complete => 1,
+    DiagnosticPhase.idle => 0,
+  };
+
+  String _phaseLabel(DiagnosticPhase phase) => switch (phase) {
+    DiagnosticPhase.idle => 'Waiting to start',
+    DiagnosticPhase.idlePing => 'Step 1 of 3: measuring idle ping',
+    DiagnosticPhase.download => 'Step 2 of 3: download test + concurrent ping',
+    DiagnosticPhase.upload => 'Step 3 of 3: upload test + concurrent ping',
+    DiagnosticPhase.complete => 'Updated just now',
+  };
+
+  String _healthLabel(NetworkHealth health) => switch (health) {
+    NetworkHealth.unknown => 'Waiting',
+    NetworkHealth.testing => 'Testing',
+    NetworkHealth.excellent => 'Excellent',
+    NetworkHealth.fair => 'Fair',
+    NetworkHealth.poor => 'Poor',
+    NetworkHealth.degraded => 'Degraded',
+  };
+
+  IconData _healthIcon(NetworkHealth health) => switch (health) {
+    NetworkHealth.excellent => Icons.bolt,
+    NetworkHealth.fair => Icons.wifi,
+    NetworkHealth.poor => Icons.network_check,
+    NetworkHealth.degraded => Icons.wifi_off,
+    _ => Icons.speed,
+  };
+
+  Color _healthColor(NetworkHealth health, ColorScheme scheme) =>
+      switch (health) {
+        NetworkHealth.excellent => Colors.green,
+        NetworkHealth.fair => Colors.orange,
+        NetworkHealth.poor => Colors.deepOrange,
+        NetworkHealth.degraded => scheme.error,
+        _ => scheme.primary,
+      };
+}
+
+class _MetricCard extends StatelessWidget {
+  const _MetricCard({
+    required this.label,
+    required this.value,
+    required this.icon,
+  });
+  final String label;
+  final String value;
+  final IconData icon;
+
+  @override
+  Widget build(BuildContext context) => Card(
+    child: Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(icon, color: Theme.of(context).colorScheme.primary),
+          const SizedBox(height: 10),
+          Text(label, style: Theme.of(context).textTheme.labelMedium),
+          Text(
+            value,
+            style: Theme.of(context).textTheme.titleLarge
+                ?.copyWith(fontWeight: FontWeight.bold),
+          ),
+        ],
+      ),
+    ),
+  );
+}
 
 class NetworkMonitorScreen extends StatefulWidget {
   const NetworkMonitorScreen({super.key});
