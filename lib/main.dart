@@ -1,16 +1,19 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:http/http.dart' as http;
+import 'package:flutter_nearby_connections_plus/flutter_nearby_connections_plus.dart';
 
 void main() => runApp(
   MultiProvider(
     providers: [
       ChangeNotifierProvider(create: (_) => ThemeProvider()),
       ChangeNotifierProvider(create: (_) => NetworkHealthProvider()),
+      ChangeNotifierProvider(create: (_) => LocalMeshChatProvider()),
     ],
     child: const PortfolioApp(),
   ),
@@ -226,6 +229,7 @@ class PortfolioApp extends StatelessWidget {
         '/activity-one': (_) => const ActivityOneScreen(),
         '/activity-two': (_) => const NetworkMonitorScreen(),
         '/network-diagnostic': (_) => const NetworkDiagnosticScreen(),
+        '/local-mesh-chat': (_) => const LocalMeshChatScreen(),
         '/settings': (_) => const SettingsScreen(),
       },
     );
@@ -333,6 +337,15 @@ class DashboardScreen extends StatelessWidget {
                     icon: Icons.speed_outlined,
                     onTap: () =>
                         Navigator.pushNamed(context, '/network-diagnostic'),
+                  ),
+                  const SizedBox(height: 16),
+                  ActivityCard(
+                    number: '04',
+                    title: 'Local Mesh Chat',
+                    description: 'Serverless P2P messaging that discovers nearby devices and routes text without internet.',
+                    icon: Icons.bluetooth_audio,
+                    onTap: () =>
+                        Navigator.pushNamed(context, '/local-mesh-chat'),
                   ),
                   const SizedBox(height: 24),
                   const InfoPanel(
@@ -572,6 +585,796 @@ class SettingsScreen extends StatelessWidget {
         ],
       ),
     );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Local Mesh Chat Provider
+// ─────────────────────────────────────────────────────────────────────────────
+
+class ChatMessage {
+  const ChatMessage({
+    required this.text,
+    required this.isFromMe,
+    required this.timestamp,
+    this.senderName,
+  });
+
+  final String text;
+  final bool isFromMe;
+  final DateTime timestamp;
+  final String? senderName;
+}
+
+class NearbyDevice {
+  const NearbyDevice({
+    required this.deviceId,
+    required this.deviceName,
+    required this.state,
+  });
+
+  final String deviceId;
+  final String deviceName;
+  final SessionState state;
+
+  bool get isConnected => state == SessionState.connected;
+}
+
+class LocalMeshChatProvider extends ChangeNotifier {
+  LocalMeshChatProvider() {
+    try {
+      if (Platform.isAndroid || Platform.isIOS) {
+        _nearbyService = NearbyService();
+      }
+    } catch (e) {
+      // Platform not supported (e.g., web)
+    }
+  }
+
+  NearbyService? _nearbyService;
+  final List<NearbyDevice> _devices = [];
+  final List<ChatMessage> _messages = [];
+  NearbyDevice? _connectedDevice;
+  bool _isAdvertising = false;
+  bool _isDiscovering = false;
+  String? _error;
+  StreamSubscription? _stateSubscription;
+  StreamSubscription? _dataSubscription;
+
+  List<NearbyDevice> get devices => List.unmodifiable(_devices);
+  List<ChatMessage> get messages => List.unmodifiable(_messages);
+  NearbyDevice? get connectedDevice => _connectedDevice;
+  bool get isAdvertising => _isAdvertising;
+  bool get isDiscovering => _isDiscovering;
+  String? get error => _error;
+  bool get isConnected => _connectedDevice != null;
+
+  bool get isPlatformSupported {
+    try {
+      return Platform.isAndroid || Platform.isIOS;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  bool get isIOS {
+    try {
+      return Platform.isIOS;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  static const String _serviceType = 'mpconn';
+
+  Future<void> startAdvertising(String deviceName) async {
+    if (!isPlatformSupported) {
+      _error = 'Platform not supported. Requires Android or iOS.';
+      notifyListeners();
+      return;
+    }
+
+    try {
+      _error = null;
+      notifyListeners();
+
+      await _nearbyService!.init(
+        serviceType: _serviceType,
+        deviceName: deviceName,
+        strategy: Strategy.P2P_CLUSTER,
+        callback: (isRunning) async {
+          if (isRunning) {
+            await _nearbyService!.stopAdvertisingPeer();
+            await _nearbyService!.stopBrowsingForPeers();
+            await Future.delayed(const Duration(microseconds: 200));
+            await _nearbyService!.startAdvertisingPeer();
+            await _nearbyService!.startBrowsingForPeers();
+            _isAdvertising = true;
+            _isDiscovering = false;
+            _addLog('Started advertising as $deviceName');
+            notifyListeners();
+          }
+        },
+      );
+
+      _setupListeners();
+    } catch (e) {
+      _error = 'Failed to start advertising: $e';
+      notifyListeners();
+    }
+  }
+
+  Future<void> startDiscovery(String deviceName) async {
+    if (!isPlatformSupported) {
+      _error = 'Platform not supported. Requires Android or iOS.';
+      notifyListeners();
+      return;
+    }
+
+    try {
+      _error = null;
+      notifyListeners();
+
+      await _nearbyService!.init(
+        serviceType: _serviceType,
+        deviceName: deviceName,
+        strategy: Strategy.P2P_CLUSTER,
+        callback: (isRunning) async {
+          if (isRunning) {
+            await _nearbyService!.stopBrowsingForPeers();
+            await Future.delayed(const Duration(microseconds: 200));
+            await _nearbyService!.startBrowsingForPeers();
+            _isDiscovering = true;
+            _isAdvertising = false;
+            _addLog('Started discovery as $deviceName');
+            notifyListeners();
+          }
+        },
+      );
+
+      _setupListeners();
+    } catch (e) {
+      _error = 'Failed to start discovery: $e';
+      notifyListeners();
+    }
+  }
+
+  void _setupListeners() {
+    _stateSubscription = _nearbyService!.stateChangedSubscription(
+      callback: (devicesList) {
+        for (final device in devicesList) {
+          _addDevice(device);
+          if (device.state == SessionState.connected) {
+            _handleConnection(device);
+          } else if (device.state == SessionState.notConnected) {
+            _handleDisconnection(device.deviceId);
+          }
+        }
+      },
+    );
+
+    _dataSubscription = _nearbyService!.dataReceivedSubscription(
+      callback: (data) {
+        if (data.containsKey('device_id') && data.containsKey('message')) {
+          _handleMessage(data['device_id'], data['message']);
+        }
+      },
+    );
+  }
+
+  Future<void> connectToDevice(String deviceId) async {
+    if (!isPlatformSupported) {
+      _error = 'Platform not supported. Requires Android or iOS.';
+      notifyListeners();
+      return;
+    }
+
+    try {
+      _error = null;
+      notifyListeners();
+
+      final device = _devices.firstWhere(
+        (d) => d.deviceId == deviceId,
+        orElse: () => NearbyDevice(
+          deviceId: deviceId,
+          deviceName: 'Unknown',
+          state: SessionState.notConnected,
+        ),
+      );
+
+      await _nearbyService!.invitePeer(
+        deviceID: deviceId,
+        deviceName: device.deviceName,
+      );
+      _addLog('Connecting to ${device.deviceName}...');
+    } catch (e) {
+      _error = 'Failed to connect: $e';
+      notifyListeners();
+    }
+  }
+
+  Future<void> sendMessage(String text) async {
+    if (_connectedDevice == null) {
+      _error = 'No device connected';
+      notifyListeners();
+      return;
+    }
+
+    if (!isPlatformSupported) {
+      _error = 'Platform not supported. Requires Android or iOS.';
+      notifyListeners();
+      return;
+    }
+
+    try {
+      _error = null;
+      await _nearbyService!.sendMessage(
+        _connectedDevice!.deviceId,
+        text,
+      );
+
+      _addMessage(text, isFromMe: true);
+      _addLog('Message sent to ${_connectedDevice!.deviceName}');
+    } catch (e) {
+      _error = 'Failed to send message: $e';
+      notifyListeners();
+    }
+  }
+
+  void disconnect() async {
+    if (_connectedDevice != null && _nearbyService != null) {
+      await _nearbyService!.disconnectPeer(deviceID: _connectedDevice!.deviceId);
+      _handleDisconnection(_connectedDevice!.deviceId);
+    }
+  }
+
+  void stop() async {
+    _stateSubscription?.cancel();
+    _dataSubscription?.cancel();
+    if (_nearbyService != null) {
+      await _nearbyService!.stopAdvertisingPeer();
+      await _nearbyService!.stopBrowsingForPeers();
+    }
+    _isAdvertising = false;
+    _isDiscovering = false;
+    _devices.clear();
+    _connectedDevice = null;
+    _addLog('Stopped advertising/discovery');
+    notifyListeners();
+  }
+
+  void _handleConnection(Device device) {
+    _connectedDevice = NearbyDevice(
+      deviceId: device.deviceId,
+      deviceName: device.deviceName,
+      state: device.state,
+    );
+    _addLog('Connected to ${device.deviceName}');
+    notifyListeners();
+  }
+
+  void _handleDisconnection(String deviceId) {
+    _connectedDevice = null;
+    final existingDevice = _devices.firstWhere(
+      (d) => d.deviceId == deviceId,
+      orElse: () => NearbyDevice(
+        deviceId: deviceId,
+        deviceName: 'Unknown',
+        state: SessionState.notConnected,
+      ),
+    );
+    _addDevice(Device(
+      deviceId,
+      existingDevice.deviceName,
+      0,
+    ));
+    _addLog('Disconnected from $deviceId');
+    notifyListeners();
+  }
+
+  void _handleMessage(String deviceId, String payload) {
+    final device = _devices.firstWhere(
+      (d) => d.deviceId == deviceId,
+      orElse: () => NearbyDevice(
+        deviceId: deviceId,
+        deviceName: 'Unknown',
+        state: SessionState.connected,
+      ),
+    );
+
+    _addMessage(payload, isFromMe: false, senderName: device.deviceName);
+    _addLog('Message received from ${device.deviceName}');
+  }
+
+  void _addDevice(Device device) {
+    final existingIndex = _devices.indexWhere((d) => d.deviceId == device.deviceId);
+    if (existingIndex != -1) {
+      _devices[existingIndex] = NearbyDevice(
+        deviceId: device.deviceId,
+        deviceName: device.deviceName.isEmpty ? _devices[existingIndex].deviceName : device.deviceName,
+        state: device.state,
+      );
+    } else {
+      _devices.add(NearbyDevice(
+        deviceId: device.deviceId,
+        deviceName: device.deviceName,
+        state: device.state,
+      ));
+    }
+    notifyListeners();
+  }
+
+  void _addMessage(String text, {required bool isFromMe, String? senderName}) {
+    _messages.add(ChatMessage(
+      text: text,
+      isFromMe: isFromMe,
+      timestamp: DateTime.now(),
+      senderName: senderName,
+    ));
+    notifyListeners();
+  }
+
+  void _addLog(String message) {
+    debugPrint('[MeshChat] $message');
+  }
+
+  @override
+  void dispose() {
+    stop();
+    super.dispose();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Activity 04 — Local Mesh Chat
+// ─────────────────────────────────────────────────────────────────────────────
+
+class LocalMeshChatScreen extends StatefulWidget {
+  const LocalMeshChatScreen({super.key});
+
+  @override
+  State<LocalMeshChatScreen> createState() => _LocalMeshChatScreenState();
+}
+
+class _LocalMeshChatScreenState extends State<LocalMeshChatScreen> {
+  final TextEditingController _messageController = TextEditingController();
+  final TextEditingController _nameController = TextEditingController(text: 'Device-${Random().nextInt(9999)}');
+  final ScrollController _scrollController = ScrollController();
+
+  @override
+  void dispose() {
+    _messageController.dispose();
+    _nameController.dispose();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _scrollToBottom() {
+    if (_scrollController.hasClients) {
+      _scrollController.animateTo(
+        _scrollController.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeOut,
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final chatProvider = context.watch<LocalMeshChatProvider>();
+    final scheme = Theme.of(context).colorScheme;
+
+    return AppShell(
+      title: 'Local Mesh Chat',
+      child: Column(
+        children: [
+          Expanded(
+            child: ListView(
+              padding: const EdgeInsets.all(24),
+              children: [
+                Text(
+                  'Serverless Local Chat',
+                  style: Theme.of(context).textTheme.headlineMedium
+                      ?.copyWith(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Discover nearby devices and chat without internet. Uses P2P mesh networking via Bluetooth/Wi-Fi.',
+                ),
+                const SizedBox(height: 24),
+
+                // Platform warning
+                if (!chatProvider.isPlatformSupported)
+                  Card(
+                    color: scheme.error.withValues(alpha: 0.1),
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Row(
+                        children: [
+                          Icon(Icons.warning_amber_rounded, color: scheme.error),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'Platform Not Supported',
+                                  style: TextStyle(
+                                    color: scheme.error,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                const Text(
+                                  'Local Mesh Chat requires Android or iOS real devices. '
+                                  'Bluetooth/Wi-Fi P2P is not available on this platform.',
+                                  style: TextStyle(color: Colors.red),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                if (chatProvider.isPlatformSupported && chatProvider.isIOS)
+                  Card(
+                    color: scheme.primary.withValues(alpha: 0.1),
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Row(
+                        children: [
+                          Icon(Icons.info_outline, color: scheme.primary),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'iOS Setup Required',
+                                  style: TextStyle(
+                                    color: scheme.primary,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                const Text(
+                                  'Add these permissions to ios/Runner/Info.plist:\n'
+                                  '• NSBonjourServices\n'
+                                  '• NSBluetoothAlwaysUsageDescription\n'
+                                  '• UIRequiresPersistentWiFi',
+                                  style: TextStyle(fontSize: 12),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                const SizedBox(height: 16),
+
+                // Device name input
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: TextField(
+                      controller: _nameController,
+                      enabled: chatProvider.isPlatformSupported,
+                      decoration: InputDecoration(
+                        labelText: 'Your device name',
+                        prefixIcon: const Icon(Icons.devices),
+                        border: const OutlineInputBorder(),
+                        suffixIcon: !chatProvider.isPlatformSupported
+                            ? const Icon(Icons.block, color: Colors.grey)
+                            : null,
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+
+                // Connection controls
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: FilledButton.icon(
+                                onPressed: !chatProvider.isPlatformSupported || chatProvider.isAdvertising
+                                    ? null
+                                    : () => chatProvider.startAdvertising(_nameController.text),
+                                icon: const Icon(Icons.broadcast_on_personal),
+                                label: const Text('Advertise'),
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: FilledButton.icon(
+                                onPressed: !chatProvider.isPlatformSupported || chatProvider.isDiscovering
+                                    ? null
+                                    : () => chatProvider.startDiscovery(_nameController.text),
+                                icon: const Icon(Icons.search),
+                                label: const Text('Discover'),
+                              ),
+                            ),
+                          ],
+                        ),
+                        if (chatProvider.isAdvertising || chatProvider.isDiscovering) ...[
+                          const SizedBox(height: 12),
+                          OutlinedButton.icon(
+                            onPressed: chatProvider.stop,
+                            icon: const Icon(Icons.stop),
+                            label: const Text('Stop'),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+
+                // Status indicator
+                _buildStatusCard(chatProvider, scheme),
+                const SizedBox(height: 16),
+
+                // Nearby devices list
+                if (chatProvider.devices.isNotEmpty) ...[
+                  Text(
+                    'NEARBY DEVICES',
+                    style: Theme.of(context).textTheme.labelLarge
+                        ?.copyWith(letterSpacing: 1.5),
+                  ),
+                  const SizedBox(height: 8),
+                  ...chatProvider.devices.map(
+                    (device) => Card(
+                      color: device.isConnected
+                          ? scheme.primary.withValues(alpha: 0.1)
+                          : null,
+                      child: ListTile(
+                        leading: Icon(
+                          device.isConnected ? Icons.link : Icons.bluetooth_searching,
+                          color: device.isConnected ? scheme.primary : null,
+                        ),
+                        title: Text(device.deviceName),
+                        subtitle: Text(device.deviceId),
+                        trailing: device.isConnected
+                            ? const Icon(Icons.check_circle, color: Colors.green)
+                            : FilledButton(
+                                onPressed: device.state == SessionState.connecting
+                                    ? null
+                                    : () => chatProvider.connectToDevice(device.deviceId),
+                                child: Text(
+                                  device.state == SessionState.connecting
+                                      ? 'Connecting...'
+                                      : 'Connect',
+                                ),
+                              ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                ],
+
+                // Error display
+                if (chatProvider.error != null) ...[
+                  Card(
+                    color: scheme.error.withValues(alpha: 0.1),
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Row(
+                        children: [
+                          Icon(Icons.error_outline, color: scheme.error),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              chatProvider.error!,
+                              style: TextStyle(color: scheme.error),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                ],
+
+                // Chat messages
+                if (chatProvider.isConnected) ...[
+                  Text(
+                    'CHAT',
+                    style: Theme.of(context).textTheme.labelLarge
+                        ?.copyWith(letterSpacing: 1.5),
+                  ),
+                  const SizedBox(height: 8),
+                  Container(
+                    constraints: const BoxConstraints(maxHeight: 300),
+                    decoration: BoxDecoration(
+                      color: scheme.surface,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: scheme.outline),
+                    ),
+                    child: chatProvider.messages.isEmpty
+                        ? Center(
+                            child: Text(
+                              'No messages yet. Start chatting!',
+                              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                                color: scheme.onSurface.withValues(alpha: 0.5),
+                              ),
+                            ),
+                          )
+                        : ListView.builder(
+                            controller: _scrollController,
+                            padding: const EdgeInsets.all(12),
+                            itemCount: chatProvider.messages.length,
+                            itemBuilder: (context, index) {
+                              final message = chatProvider.messages[index];
+                              return _MessageBubble(message: message);
+                            },
+                          ),
+                  ),
+                  const SizedBox(height: 16),
+                ],
+              ],
+            ),
+          ),
+
+          // Message input bar
+          if (chatProvider.isConnected)
+            Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: scheme.surface,
+                border: Border(top: BorderSide(color: scheme.outline)),
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _messageController,
+                      decoration: const InputDecoration(
+                        hintText: 'Type a message...',
+                        border: OutlineInputBorder(),
+                      ),
+                      onSubmitted: (text) {
+                        if (text.isNotEmpty) {
+                          chatProvider.sendMessage(text);
+                          _messageController.clear();
+                          _scrollToBottom();
+                        }
+                      },
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  FilledButton.icon(
+                    onPressed: () {
+                      if (_messageController.text.isNotEmpty) {
+                        chatProvider.sendMessage(_messageController.text);
+                        _messageController.clear();
+                        _scrollToBottom();
+                      }
+                    },
+                    icon: const Icon(Icons.send),
+                    label: const Text('Send'),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStatusCard(LocalMeshChatProvider provider, ColorScheme scheme) {
+    String status;
+    IconData icon;
+    Color color;
+
+    if (provider.isConnected) {
+      status = 'Connected to ${provider.connectedDevice?.deviceName ?? 'device'}';
+      icon = Icons.link;
+      color = Colors.green;
+    } else if (provider.isAdvertising) {
+      status = 'Advertising - waiting for connections';
+      icon = Icons.broadcast_on_personal;
+      color = scheme.primary;
+    } else if (provider.isDiscovering) {
+      status = 'Discovering - scanning for devices';
+      icon = Icons.search;
+      color = scheme.primary;
+    } else {
+      status = 'Idle - advertise or discover to start';
+      icon = Icons.wifi_off;
+      color = scheme.onSurface.withValues(alpha: 0.5);
+    }
+
+    return Card(
+      color: color.withValues(alpha: 0.1),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          children: [
+            Icon(icon, color: color),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                status,
+                style: TextStyle(color: color, fontWeight: FontWeight.bold),
+              ),
+            ),
+            if (provider.isConnected)
+              IconButton(
+                icon: const Icon(Icons.link_off),
+                onPressed: provider.disconnect,
+                tooltip: 'Disconnect',
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _MessageBubble extends StatelessWidget {
+  const _MessageBubble({required this.message});
+
+  final ChatMessage message;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final isFromMe = message.isFromMe;
+
+    return Align(
+      alignment: isFromMe ? Alignment.centerRight : Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 8),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+        decoration: BoxDecoration(
+          color: isFromMe ? scheme.primary : scheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (!isFromMe && message.senderName != null)
+              Text(
+                message.senderName!,
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  color: isFromMe ? scheme.onPrimary : scheme.onSurface,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            Text(
+              message.text,
+              style: TextStyle(
+                color: isFromMe ? scheme.onPrimary : scheme.onSurface,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              _formatTime(message.timestamp),
+              style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                color: isFromMe
+                    ? scheme.onPrimary.withValues(alpha: 0.7)
+                    : scheme.onSurface.withValues(alpha: 0.5),
+                fontSize: 10,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _formatTime(DateTime time) {
+    final hour = time.hour.toString().padLeft(2, '0');
+    final minute = time.minute.toString().padLeft(2, '0');
+    return '$hour:$minute';
   }
 }
 

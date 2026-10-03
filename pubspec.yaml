@@ -33,6 +33,7 @@ dependencies:
   provider: ^6.1.5+1
   connectivity_plus: ^6.1.4
   http: ^1.6.0
+  flutter_nearby_connections_plus: ^1.2.2
 
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
